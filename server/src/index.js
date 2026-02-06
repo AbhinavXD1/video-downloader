@@ -1,9 +1,9 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import ytdl from "ytdl-core";
-import ffmpeg from "fluent-ffmpeg";
 import { URL } from "url";
+import https from "https";
+import http from "http";
 
 dotenv.config();
 
@@ -13,21 +13,98 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-// Allow only specific hosts for security. Extend as needed.
-const ALLOWED_HOSTS = ["www.youtube.com", "youtube.com", "youtu.be"];
+// Allow only X (Twitter) and Reddit hosts
+const ALLOWED_HOSTS = [
+  "twitter.com",
+  "www.twitter.com",
+  "x.com",
+  "www.x.com",
+  "mobile.twitter.com",
+  "mobile.x.com",
+  "reddit.com",
+  "www.reddit.com",
+  "v.redd.it",
+];
 
 function validateVideoUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);
-    if (!ALLOWED_HOSTS.includes(url.hostname)) {
-      return { valid: false, reason: "Currently only YouTube URLs are supported." };
+    const hostname = url.hostname.toLowerCase();
+    
+    // Check if hostname matches allowed hosts (including subdomains)
+    const isAllowed = ALLOWED_HOSTS.some((allowed) => {
+      return hostname === allowed || hostname.endsWith(`.${allowed}`);
+    });
+    
+    if (!isAllowed) {
+      return { valid: false, reason: "Only X (Twitter) and Reddit video links are supported." };
     }
-    if (!ytdl.validateURL(rawUrl)) {
-      return { valid: false, reason: "Invalid YouTube URL." };
+    
+    // Basic URL structure validation
+    if (hostname.includes("twitter.com") || hostname.includes("x.com")) {
+      // X/Twitter URLs should contain /status/ or similar patterns
+      if (!url.pathname.match(/\/(status|i)\//)) {
+        return { valid: false, reason: "Invalid X (Twitter) video link." };
+      }
+    } else if (hostname.includes("reddit.com")) {
+      // Reddit URLs should be post links
+      if (!url.pathname.match(/\/r\/\w+\/.*/)) {
+        return { valid: false, reason: "Invalid Reddit post link." };
+      }
     }
+    
     return { valid: true };
   } catch {
     return { valid: false, reason: "Invalid URL format." };
+  }
+}
+
+/**
+ * Helper to fetch JSON from a URL
+ */
+function fetchJSON(url) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith("https") ? https : http;
+    client
+      .get(url, { headers: { "User-Agent": "QuickXSave/1.0" } }, (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch {
+            reject(new Error("Invalid JSON response"));
+          }
+        });
+      })
+      .on("error", reject);
+  });
+}
+
+/**
+ * Extract video URL from Reddit post
+ */
+async function extractRedditVideo(url) {
+  try {
+    const jsonUrl = url.endsWith("/") ? `${url}.json` : `${url}/.json`;
+    const data = await fetchJSON(jsonUrl);
+    
+    if (Array.isArray(data) && data[0]?.data?.children?.[0]?.data) {
+      const post = data[0].data.children[0].data;
+      const videoUrl = post?.media?.reddit_video?.fallback_url || 
+                       post?.secure_media?.reddit_video?.fallback_url;
+      
+      if (videoUrl) {
+        return {
+          title: post.title || "Reddit Video",
+          videoUrl: videoUrl.replace("?source=fallback", ""),
+        };
+      }
+    }
+    return null;
+  } catch (err) {
+    console.error("Reddit extraction error:", err);
+    return null;
   }
 }
 
@@ -48,43 +125,37 @@ app.post("/api/inspect", async (req, res) => {
   }
 
   try {
-    const info = await ytdl.getInfo(url);
-
-    const title = info.videoDetails.title;
-
-    // Filter and map available video+audio formats (MP4)
-    const videoFormats = ytdl
-      .filterFormats(info.formats, "videoandaudio")
-      .filter((f) => f.container === "mp4")
-      .map((f) => ({
-        itag: f.itag,
-        qualityLabel: f.qualityLabel,
-        bitrate: f.bitrate,
-        fps: f.fps,
-        sizeApprox: f.contentLength ? Number(f.contentLength) : undefined,
-      }))
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-    // Audio-only formats for MP3 conversion
-    const audioFormats = ytdl
-      .filterFormats(info.formats, "audioonly")
-      .map((f) => ({
-        itag: f.itag,
-        bitrate: f.bitrate,
-        audioQuality: f.audioQuality,
-      }))
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.toLowerCase();
+    
+    let title = "Video";
+    let videoUrl = null;
+    
+    if (hostname.includes("reddit.com")) {
+      const result = await extractRedditVideo(url);
+      if (result) {
+        title = result.title;
+        videoUrl = result.videoUrl;
+      } else {
+        return res.status(400).json({
+          error: "Could not find video in this Reddit post. Make sure it's a public post with a video.",
+        });
+      }
+    } else if (hostname.includes("twitter.com") || hostname.includes("x.com")) {
+      title = "X (Twitter) Video";
+      videoUrl = url;
+    }
 
     return res.json({
       title,
       url,
-      videoFormats,
-      audioFormats,
+      videoFormats: videoUrl ? [{ itag: "default", qualityLabel: "Default", directUrl: videoUrl }] : [],
+      audioFormats: [],
     });
   } catch (err) {
     console.error("Error inspecting URL:", err);
     return res.status(500).json({
-      error: "Failed to fetch video information. The video may be unavailable or unsupported.",
+      error: "Unable to process this link. Make sure it's a public X or Reddit video post.",
     });
   }
 });
@@ -92,10 +163,10 @@ app.post("/api/inspect", async (req, res) => {
 /**
  * GET /api/download
  * Query: ?url=...&type=mp4|mp3&itag=...
- * Streams the requested format directly to the client.
+ * Redirects to direct video URL or streams the video.
  */
 app.get("/api/download", async (req, res) => {
-  const { url, type = "mp4", itag } = req.query;
+  const { url } = req.query;
 
   if (!url) {
     return res.status(400).json({ error: "Missing url query parameter." });
@@ -107,64 +178,35 @@ app.get("/api/download", async (req, res) => {
   }
 
   try {
-    const info = await ytdl.getInfo(url);
-    const titleSafe = info.videoDetails.title.replace(/[^\w\-]+/g, "_");
-
-    if (type === "mp3") {
-      // Audio-only stream -> FFmpeg -> MP3
-      const audioStream = ytdl(url, {
-        quality: itag ? itag : "highestaudio",
-        filter: "audioonly",
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.toLowerCase();
+    
+    let videoUrl = null;
+    
+    if (hostname.includes("reddit.com")) {
+      const result = await extractRedditVideo(url);
+      if (result) {
+        videoUrl = result.videoUrl;
+      } else {
+        return res.status(400).json({
+          error: "Could not find video in this Reddit post.",
+        });
+      }
+    } else if (hostname.includes("twitter.com") || hostname.includes("x.com")) {
+      return res.status(400).json({
+        error: "X (Twitter) video extraction requires additional setup. Please use a dedicated X video downloader.",
       });
-
-      res.setHeader("Content-Type", "audio/mpeg");
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="${titleSafe}.mp3"`
-      );
-
-      ffmpeg(audioStream)
-        .format("mp3")
-        .audioCodec("libmp3lame")
-        .on("error", (err) => {
-          console.error("FFmpeg error:", err);
-          if (!res.headersSent) {
-            res.status(500).end("Conversion failed.");
-          } else {
-            res.end();
-          }
-        })
-        .pipe(res, { end: true });
-    } else {
-      // MP4 with video+audio
-      const options = {
-        quality: itag ? itag : "highest",
-        filter: "videoandaudio",
-      };
-
-      res.setHeader("Content-Type", "video/mp4");
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="${titleSafe}.mp4"`
-      );
-
-      const downloadStream = ytdl(url, options);
-
-      downloadStream.on("error", (err) => {
-        console.error("ytdl error:", err);
-        if (!res.headersSent) {
-          res.status(500).end("Download failed.");
-        } else {
-          res.end();
-        }
-      });
-
-      downloadStream.pipe(res);
     }
+
+    if (!videoUrl) {
+      return res.status(400).json({ error: "Could not extract video URL." });
+    }
+
+    res.redirect(videoUrl);
   } catch (err) {
     console.error("Download error:", err);
     if (!res.headersSent) {
-      return res.status(500).json({ error: "Failed to start download." });
+      return res.status(500).json({ error: "Failed to process download." });
     }
     res.end();
   }
@@ -175,7 +217,6 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Video downloader API listening on port ${PORT}`);
-  console.log(`Allowed hosts: ${ALLOWED_HOSTS.join(", ")}`);
+  console.log(`QuickXSave API listening on port ${PORT}`);
+  console.log(`Supported platforms: X (Twitter) and Reddit`);
 });
-
