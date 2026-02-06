@@ -1,6 +1,8 @@
 import React, { useState } from "react";
 import axios from "axios";
 
+const API_BASE = "https://video-downloader-server-production-b73d.up.railway.app";
+
 const INITIAL_STATE = {
   url: "",
   loadingInspect: false,
@@ -50,7 +52,7 @@ function App() {
     }));
 
     try {
-      const res = await axios.post("/api/inspect", {
+      const res = await axios.post(`${API_BASE}/api/inspect`, {
         url: state.url.trim(),
       });
       const { data } = res;
@@ -121,7 +123,7 @@ function App() {
       });
 
       // Navigate to the download endpoint so the browser handles the file save dialog.
-      window.location.href = `/api/download?${params.toString()}`;
+      window.location.href = `${API_BASE}/api/download?${params.toString()}`;
 
       setTimeout(() => {
         setState((s) => ({
