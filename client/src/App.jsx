@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import axios from "axios";
 
-const API_BASE = "https://video-downloader-server-production-b73d.up.railway.app";
+const API_BASE = "video-downloader-server-production-4efe.up.railway.app";
 
 const INITIAL_STATE = {
   url: "",
